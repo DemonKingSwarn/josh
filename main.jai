@@ -2296,8 +2296,8 @@ main :: () {
 
 term_name :: "josh";
 
-#load "fontconfig.jai";
-#load "libc.jai";
+#load "src/fontconfig.jai";
+#load "src/libc.jai";
 
 #import "Basic";
 #import "POSIX";
