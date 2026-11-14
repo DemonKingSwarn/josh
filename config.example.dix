@@ -26,3 +26,5 @@ palette = {
   bright_cyan   = "#94e2d5";
   bright_white  = "#a6adc8";
 };
+
+// vim: ft=nix
