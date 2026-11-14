@@ -2419,7 +2419,7 @@ main :: () {
   }
 
   SetConfigFlags(cast(u32) ConfigFlags.FLAG_WINDOW_RESIZABLE);
-  InitWindow(1200, 800, "Jai Terminal");
+  InitWindow(1200, 800, term_name);
   SetWindowMinSize(320, 200);
   SetTargetFPS(60);
   SetExitKey(0);
@@ -2516,3 +2516,5 @@ main :: () {
   ghostty_terminal_free(app.term);
   CloseWindow();
 }
+
+term_name :: "josh";
