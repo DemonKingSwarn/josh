@@ -116,6 +116,8 @@ TextEngine :: struct {
   face_count: s32;
   primary:    s32;
   emoji:      s32;
+  emoji_path: [1024] u8;
+  emoji_index: s32;
   glyphs:     [GLYPH_CACHE_CAP] GlyphEntry;
   glyph_count: s32;
   fallback:   GlyphEntry;
@@ -333,10 +335,28 @@ TextEngine_init :: (eng: *TextEngine, size: s32, custom_font: *u8) -> bool {
   ];
   for i: 0..emoji_families.count-1 {
     f := emoji_families[i];
-    eng.emoji = TextEngine_load_family(eng, f.data, false);
-    if eng.emoji >= 0 break;
+    path: [1024] u8;
+    index: s32 = 0;
+    if fc_find_family(f.data, false, *path, *index) {
+      eng.emoji = TextEngine_load_face(eng, path.data, index);
+      if eng.emoji >= 0 {
+        copy_cstr(path.data, *eng.emoji_path);
+        eng.emoji_index = index;
+        break;
+      }
+    }
   }
-  if eng.emoji < 0 eng.emoji = TextEngine_load_for_cp(eng, 0x1F600);
+  if eng.emoji < 0 {
+    path: [1024] u8;
+    index: s32 = 0;
+    if fc_find_for_cp(0x1F600, *path, *index) {
+      eng.emoji = TextEngine_load_face(eng, path.data, index);
+      if eng.emoji >= 0 {
+        copy_cstr(path.data, *eng.emoji_path);
+        eng.emoji_index = index;
+      }
+    }
+  }
 
   p := eng.faces[eng.primary];
   eng.cell_w = TextEngine_advance(eng, eng.primary, 77); // 'M'
@@ -446,139 +466,18 @@ pick_face_utf8 :: (eng: *TextEngine, s: *u8, len: u64) -> s32 {
   return pick_face(eng, *cps, n);
 }
 
-svg_glyph_id :: (glyph: u32, buf: *[16] u8) {
-  buf.*[0] = 35; // '#'
-  for i: 0..4 buf.*[1 + i] = "glyph".data[i];
-  digits: [10] u8;
-  dn: s32 = 0;
-  g := glyph;
-  if g == 0 { digits[0] = 48; dn = 1; }
-  while g > 0 {
-    digits[dn] = cast(u8) (48 + g % 10);
-    dn += 1;
-    g /= 10;
-  }
-  pos: s32 = 6;
-  i: s32 = dn - 1;
-  while i >= 0 {
-    buf.*[pos] = digits[i];
-    pos += 1;
-    i -= 1;
-  }
-  buf.*[pos] = 0;
-}
-
-render_svg_glyph :: (slot: *FT_GlyphSlotRec, w: *s32, h: *s32, out_pixels: **u8) -> bool {
-  other_ptr := cast(**void) (cast(*u8) slot + FT_SLOT_OTHER_OFFSET);
-  doc := other_ptr.*; // FT_SVG_DocumentRec*
-  if doc == null return false;
-  doc8 := cast(*u8) doc;
-  svg_bytes := (cast(**u8) doc8).*;      // doc->svg_document
-  svg_len := (cast(*u64) (doc8 + 8)).*;  // doc->svg_document_length
-  if svg_bytes == null || svg_len == 0 return false;
-
-  handle := rsvg_handle_new_from_data(svg_bytes, svg_len, null);
-  if handle == null return false;
-
-  id: [16] u8;
-  svg_glyph_id(slot.glyph_index, *id);
-
-  upem := cast(float64) slot.face.units_per_EM;
-  if upem <= 0.0 upem = 1000.0;
-  target_em := 192.0;
-  scale := target_em / upem;
-
-  surface := cairo_image_surface_create(0, 1024, 1024); // CAIRO_FORMAT_ARGB32
-  if surface == null {
-    rsvg_handle_free(handle);
-    return false;
-  }
-  cr := cairo_create(surface);
-  if cr == null {
-    cairo_surface_destroy(surface);
-    rsvg_handle_free(handle);
-    return false;
-  }
-  cairo_scale(cr, scale, scale);
-  cairo_translate(cr, 2048.0, 2048.0);
-  rsvg_handle_render_cairo_sub(handle, cr, id.data);
-
-  // Crop to the glyph's non-transparent bounding box.
-  src := cairo_image_surface_get_data(surface);
-  stride := cairo_image_surface_get_stride(surface);
-  min_x: s32 = 1024; min_y: s32 = 1024; max_x: s32 = -1; max_y: s32 = -1;
-  for y: 0..1023 {
-    row := src + y * stride;
-    for x: 0..1023 {
-      a := row[x * 4 + 3];
-      if a > 0 {
-        if x < min_x min_x = cast(s32) x;
-        if x > max_x max_x = cast(s32) x;
-        if y < min_y min_y = cast(s32) y;
-        if y > max_y max_y = cast(s32) y;
-      }
-    }
-  }
-
-  if max_x < min_x {
-    cairo_destroy(cr);
-    cairo_surface_destroy(surface);
-    rsvg_handle_free(handle);
-    return false;
-  }
-
-  cw := max_x - min_x + 1;
-  ch := max_y - min_y + 1;
-  pixels := cast(*u8) MemAlloc(cast(u32) (cw * ch * 4));
-  if pixels != null {
-    for y: 0..ch-1 {
-      srow := src + (min_y + y) * stride;
-      for x: 0..cw-1 {
-        s := srow + (min_x + x) * 4;
-        a := s[3];
-        dst := pixels + (y * cw + x) * 4;
-        if a > 0 {
-          dst[0] = cast(u8) min(255, (cast(s32) s[2] * 255) / cast(s32) a);
-          dst[1] = cast(u8) min(255, (cast(s32) s[1] * 255) / cast(s32) a);
-          dst[2] = cast(u8) min(255, (cast(s32) s[0] * 255) / cast(s32) a);
-        } else {
-          dst[0] = 0; dst[1] = 0; dst[2] = 0;
-        }
-        dst[3] = a;
-      }
-    }
-  }
-
-  cairo_destroy(cr);
-  cairo_surface_destroy(surface);
-  rsvg_handle_free(handle);
-
-  if pixels == null return false;
-  w.* = cw;
-  h.* = ch;
-  out_pixels.* = pixels;
-  return true;
-}
-
 TextEngine_glyph :: (eng: *TextEngine, face_index: s32, glyph: u32) -> *GlyphEntry {
   if face_index < 0 || face_index >= eng.face_count return *eng.fallback;
-  key := GlyphKey.{cast(u16) face_index, glyph};
-  hash := (cast(u64) glyph * 2654435761 + cast(u64) face_index * 40503) &
-          cast(u64) (GLYPH_CACHE_CAP - 1);
-  idx := cast(s32) hash;
-  start := idx;
-  while eng.glyphs[idx].used {
-    g := *eng.glyphs[idx];
-    if g.key.face == key.face && g.key.glyph == key.glyph return g;
-    idx = (idx + 1) & (GLYPH_CACHE_CAP - 1);
-    if idx == start return *eng.fallback;
-  }
-  if eng.glyph_count >= GLYPH_CACHE_CAP - 1 return *eng.fallback;
 
-  g := *eng.glyphs[idx];
-  g.* = GlyphEntry.{};
-  g.used = true;
-  g.key = key;
+  // Colour emoji (including OT-SVG) are rasterized on the worker thread.
+  if face_index == eng.emoji {
+    return emoji_glyph(eng, glyph);
+  }
+
+  g := glyph_find(eng, face_index, glyph);
+  if g != null return g;
+  g = glyph_reserve(eng, face_index, glyph);
+  if g == *eng.fallback return g;
 
   face := *eng.faces[face_index];
   if FT_Load_Glyph(face.ft, glyph, FT_LOAD_COLOR) != 0 {
@@ -590,30 +489,10 @@ TextEngine_glyph :: (eng: *TextEngine, face_index: s32, glyph: u32) -> *GlyphEnt
   g.top = slot.bitmap_top;
 
   if slot.format == FT_GLYPH_FORMAT_SVG {
-    // OT-SVG colour glyph: rasterize the embedded SVG document with librsvg.
-    w: s32; h: s32; pixels: *u8;
-    if render_svg_glyph(slot, *w, *h, *pixels) {
-      g.w = w;
-      g.h = h;
-      g.left = 0;
-      g.top = 0;
-      g.color = true;
-      im: Image;
-      im.data = pixels;
-      im.width = w;
-      im.height = h;
-      im.mipmaps = 1;
-      im.format = 7;
-      g.tex = LoadTextureFromImage(im);
-      SetTextureFilter(g.tex, 1);
-      MemFree(pixels);
-    }
-    eng.glyph_count += 1;
+    // SVG glyphs only live in the emoji face, which is handled by the worker.
     return g;
   }
 
-  // Outline (COLR or monochrome) glyphs need rendering; bitmap strikes
-  // (CBDT/sbix) are already filled in.
   if slot.format == FT_GLYPH_FORMAT_OUTLINE {
     FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL);
   }
@@ -624,52 +503,13 @@ TextEngine_glyph :: (eng: *TextEngine, face_index: s32, glyph: u32) -> *GlyphEnt
   g.color = face.color && bm.pixel_mode == FT_PIXEL_MODE_BGRA;
 
   if bm.buffer != null && g.w > 0 && g.h > 0 {
-    count := g.w * g.h;
-    pixels := cast(*u8) MemAlloc(cast(u32) (count * 4));
+    pw: s32; ph: s32;
+    pixels := ft_bitmap_to_rgba(*bm, *pw, *ph);
     if pixels != null {
-      if bm.pixel_mode == FT_PIXEL_MODE_BGRA {
-        bpp: s32 = 4;
-        for y: 0..g.h-1 {
-          row := ifx bm.pitch < 0 then bm.buffer + (g.h - 1 - y) * (-bm.pitch)
-                                else bm.buffer + y * bm.pitch;
-          for x: 0..g.w-1 {
-            src := row + x * bpp;
-            a := src[3];
-            dst := pixels + (y * g.w + x) * 4;
-            if a > 0 {
-              dst[0] = cast(u8) min(255, (cast(s32) src[2] * 255) / cast(s32) a);
-              dst[1] = cast(u8) min(255, (cast(s32) src[1] * 255) / cast(s32) a);
-              dst[2] = cast(u8) min(255, (cast(s32) src[0] * 255) / cast(s32) a);
-            } else {
-              dst[0] = 0; dst[1] = 0; dst[2] = 0;
-            }
-            dst[3] = a;
-          }
-        }
-      } else {
-        for y: 0..g.h-1 {
-          row := ifx bm.pitch < 0 then bm.buffer + (g.h - 1 - y) * (-bm.pitch)
-                                else bm.buffer + y * bm.pitch;
-          for x: 0..g.w-1 {
-            a := row[x];
-            dst := pixels + (y * g.w + x) * 4;
-            dst[0] = 255; dst[1] = 255; dst[2] = 255; dst[3] = a;
-          }
-        }
-      }
-
-      im: Image;
-      im.data = pixels;
-      im.width = g.w;
-      im.height = g.h;
-      im.mipmaps = 1;
-      im.format = 7; // PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
-      g.tex = LoadTextureFromImage(im);
-      SetTextureFilter(g.tex, 1); // BILINEAR
-      MemFree(pixels);
+      g.tex = upload_rgba_texture(pixels, g.w, g.h);
+      free(pixels);
     }
   }
-  eng.glyph_count += 1;
   return g;
 }
 
@@ -1817,7 +1657,7 @@ image_cache_slot :: (app: *App) -> *ImageCacheEntry {
   return e;
 }
 
-load_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
+submit_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
   empty: Texture2D;
   graphics: GhosttyKittyGraphics;
   if ghostty_terminal_get(app.term, .KITTY_GRAPHICS, *graphics) != .SUCCESS return empty;
@@ -1829,11 +1669,9 @@ load_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
   w: u32; h: u32;
   format: GhosttyKittyImageFormat;
   pixels: GhosttyString;
-  gen: u64;
   if ghostty_kitty_graphics_image_get(image, .WIDTH, *w) != .SUCCESS return empty;
   if ghostty_kitty_graphics_image_get(image, .HEIGHT, *h) != .SUCCESS return empty;
   if ghostty_kitty_graphics_image_get(image, .FORMAT, *format) != .SUCCESS return empty;
-  if ghostty_kitty_graphics_image_get(image, .GENERATION, *gen) != .SUCCESS return empty;
   if ghostty_kitty_graphics_image_get(image, .PIXELS, *pixels) != .SUCCESS return empty;
   if w == 0 || h == 0 || pixels.ptr == null return empty;
 
@@ -1844,47 +1682,23 @@ load_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
   expected := cast(u64) w * cast(u64) h * bpp;
   if pixels.len < expected return empty;
 
-  count := cast(u64) w * cast(u64) h;
-  rgba := cast(*u8) MemAlloc(cast(u32) (count * 4));
-  if rgba == null return empty;
+  // Reserve a cache slot now (pending), then copy the raw pixels and hand the
+  // format conversion to the worker thread.
+  e := image_cache_slot(app);
+  e.used = true;
+  e.id = id;
+  e.generation = generation;
+  e.w = cast(s32) w;
+  e.h = cast(s32) h;
+  e.tex.id = 0;
+  e.last_used = app.frame;
 
-  for i: 0..count-1 {
-    dst := rgba + i * 4;
-    src := pixels.ptr + i * bpp;
-    if format == .RGBA {
-      dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
-    } else if format == .RGB {
-      dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255;
-    } else if format == .GRAY_ALPHA {
-      dst[0] = src[0]; dst[1] = src[0]; dst[2] = src[0]; dst[3] = src[1];
-    } else if format == .GRAY {
-      dst[0] = src[0]; dst[1] = src[0]; dst[2] = src[0]; dst[3] = 255;
-    } else {
-      dst[0] = 0; dst[1] = 0; dst[2] = 0; dst[3] = 0;
-    }
-  }
+  raw := malloc(expected);
+  if raw == null return empty;
+  memcpy(raw, pixels.ptr, expected);
 
-  im: Image;
-  im.data = rgba;
-  im.width = cast(s32) w;
-  im.height = cast(s32) h;
-  im.mipmaps = 1;
-  im.format = 7;
-  tex := LoadTextureFromImage(im);
-  MemFree(rgba);
-
-  if tex.id != 0 {
-    SetTextureFilter(tex, 1);
-    e := image_cache_slot(app);
-    e.used = true;
-    e.id = id;
-    e.generation = gen;
-    e.tex = tex;
-    e.w = cast(s32) w;
-    e.h = cast(s32) h;
-    e.last_used = app.frame;
-  }
-  return tex;
+  render_submit_image(raw, expected, format, cast(s32) w, cast(s32) h, id, generation);
+  return empty;
 }
 
 get_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
@@ -1897,7 +1711,7 @@ get_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
     if e.tex.id != 0 UnloadTexture(e.tex);
     e.* = ImageCacheEntry.{};
   }
-  return load_image_texture(app, id, generation);
+  return submit_image_texture(app, id, generation);
 }
 
 draw_images :: (app: *App, layer: u32) {
@@ -1932,6 +1746,9 @@ render_terminal :: (app: *App) {
     ghostty_kitty_graphics_animation_tick(graphics,
       cast(u64) (GetTime() * 1000.0), *next_ms);
   }
+
+  // Upload any emoji / image rasterization the worker has finished.
+  render_poll(*app.text, app);
 
   bg: GhosttyColorRgb;
   fg: GhosttyColorRgb;
@@ -2215,6 +2032,12 @@ main :: () {
   desc := primary.descender;
   app.baseline = (app.cell_h - (asc - desc)) * 0.5 + asc;
 
+  // Start the rasterization worker (emoji + Kitty images).
+  emoji_path: *u8 = ifx app.text.emoji >= 0 then app.text.emoji_path.data else null;
+  if !render_worker_start(emoji_path, app.text.emoji_index) {
+    print("Failed to start the rasterization worker.\n");
+  }
+
   app.cols = 0;
   app.rows = 0;
   layout(*app);
@@ -2261,6 +2084,8 @@ main :: () {
     kill(app.child_pid, SIGHUP);
   }
 
+  render_worker_stop();
+
   // Text resources.
   for i: 0..GLYPH_CACHE_CAP-1 {
     if app.text.glyphs[i].used {
@@ -2298,6 +2123,7 @@ term_name :: "josh";
 
 #load "src/fontconfig.jai";
 #load "src/libc.jai";
+#load "src/render.jai";
 
 #import "Basic";
 #import "POSIX";

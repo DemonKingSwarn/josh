@@ -8,4 +8,5 @@ ptsname      :: (fd: s32) -> *u8 #foreign libc;
 strlen       :: (s: *u8) -> u64 #foreign libc;
 malloc       :: (size: u64) -> *u8 #foreign libc;
 free         :: (ptr: *u8) -> void #foreign libc;
+memcpy       :: (dst: *void, src: *void, n: u64) -> *void #foreign libc;
 
