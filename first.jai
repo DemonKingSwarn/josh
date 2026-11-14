@@ -1,7 +1,7 @@
 exe :: "josh";
 
 #run {
-    w := compiler_create_workspace("dork");
+    w := compiler_create_workspace("josh");
 
     options := get_build_options(w);
     opts := set_options(*options); 
