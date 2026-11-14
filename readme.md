@@ -17,7 +17,7 @@ Configuration is read from `$XDG_CONFIG_HOME/josh/config.dix` (or
 [dix](https://github.com/demonkingswarn/dix) language. Everything is optional.
 
 Supported keys: `font`, `font_size`, `padding_x`, `padding_y`, `background`,
-`foreground`, `cursor`, a nested `palette`, and `custom_shader` — a path to a
+`foreground`, `cursor`, a nested `palette`, and `custom_shader`, a path to a
 GLSL fragment shader applied as a fullscreen post-process. The shader receives
 the rendered scene as `texture0`, plus `iTime` and `iResolution` uniforms.
 
