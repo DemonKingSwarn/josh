@@ -480,31 +480,50 @@ TextEngine_glyph :: (eng: *TextEngine, face_index: s32, glyph: u32) -> *GlyphEnt
   if g == *eng.fallback return g;
 
   face := *eng.faces[face_index];
-  if FT_Load_Glyph(face.ft, glyph, FT_LOAD_COLOR) != 0 {
+
+  if face.color {
+    // Colour outline (COLR) fallback: render to RGBA.
+    if FT_Load_Glyph(face.ft, glyph, FT_LOAD_COLOR) != 0 return g;
+    slot := face.ft.glyph;
+    if slot.format == FT_GLYPH_FORMAT_SVG return g; // handled by the emoji worker
+    if slot.format == FT_GLYPH_FORMAT_OUTLINE {
+      FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL);
+    }
+    g.advance = cast(float) slot.advance.x / 64.0;
+    g.left = slot.bitmap_left;
+    g.top = slot.bitmap_top;
+    bm := slot.bitmap;
+    g.w = cast(s32) bm.width;
+    g.h = cast(s32) bm.rows;
+    g.color = bm.pixel_mode == FT_PIXEL_MODE_BGRA;
+    if bm.buffer != null && g.w > 0 && g.h > 0 {
+      pw: s32; ph: s32;
+      pixels := ft_bitmap_to_rgba(*bm, *pw, *ph);
+      if pixels != null {
+        g.tex = upload_rgba_texture(pixels, g.w, g.h);
+        free(pixels);
+      }
+    }
     return g;
   }
+
+  // Monochrome: render a signed distance field; the GPU rasterizes coverage.
+  if FT_Load_Glyph(face.ft, glyph, FT_LOAD_NO_HINTING) != 0 return g;
   slot := face.ft.glyph;
+  if slot.format == FT_GLYPH_FORMAT_OUTLINE {
+    FT_Render_Glyph(slot, FT_RENDER_MODE_SDF);
+  }
   g.advance = cast(float) slot.advance.x / 64.0;
   g.left = slot.bitmap_left;
   g.top = slot.bitmap_top;
-
-  if slot.format == FT_GLYPH_FORMAT_SVG {
-    // SVG glyphs only live in the emoji face, which is handled by the worker.
-    return g;
-  }
-
-  if slot.format == FT_GLYPH_FORMAT_OUTLINE {
-    FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL);
-  }
-
   bm := slot.bitmap;
   g.w = cast(s32) bm.width;
   g.h = cast(s32) bm.rows;
-  g.color = face.color && bm.pixel_mode == FT_PIXEL_MODE_BGRA;
+  g.color = false;
 
   if bm.buffer != null && g.w > 0 && g.h > 0 {
     pw: s32; ph: s32;
-    pixels := ft_bitmap_to_rgba(*bm, *pw, *ph);
+    pixels := ft_sdf_to_rgba(*bm, *pw, *ph);
     if pixels != null {
       g.tex = upload_rgba_texture(pixels, g.w, g.h);
       free(pixels);
@@ -561,6 +580,8 @@ Config :: struct {
   has_cursor:  bool;
   palette:     [16] GhosttyColorRgb;
   has_palette: [16] bool;
+  custom_shader: [1024] u8;
+  has_custom_shader: bool;
 }
 
 App :: struct {
@@ -1486,7 +1507,16 @@ draw_wide_cell :: (app: *App, cv: *CellVis, cell_y: float) {
   g := TextEngine_glyph(*app.text, cv.face, infos[0].codepoint);
   target_w := ifx cv.wide then app.cell_w * 2.0 else app.cell_w;
   cx := app.pad_x + cast(float) cv.x * app.cell_w;
-  draw_scaled_glyph(app, g, cx, cell_y, target_w, app.cell_h, cv.fg);
+
+  if g.color {
+    // Colour emoji: draw with the default shader.
+    draw_scaled_glyph(app, g, cx, cell_y, target_w, app.cell_h, cv.fg);
+  } else {
+    // Wide monochrome (CJK): signed distance field on the GPU.
+    BeginShaderMode(sdf_shader);
+    draw_scaled_glyph(app, g, cx, cell_y, target_w, app.cell_h, cv.fg);
+    EndShaderMode();
+  }
 }
 
 // Shape a run of adjacent single-width cells and draw its glyphs.
@@ -1506,6 +1536,7 @@ draw_shaped_run :: (app: *App, start_col: s32, cell_y: float, text: *u8, len: u6
   if infos == null || positions == null return;
 
   base_x := app.pad_x + cast(float) start_col * app.cell_w;
+  BeginShaderMode(sdf_shader);
   j := 0;
   for i: 0..cast(s32) length-1 {
     cluster := infos[i].cluster;
@@ -1519,6 +1550,7 @@ draw_shaped_run :: (app: *App, start_col: s32, cell_y: float, text: *u8, len: u6
          cast(float) positions[i].y_offset / 64.0 - cast(float) g.top;
     draw_glyph(app, g, x, y, color, bold);
   }
+  EndShaderMode();
 }
 
 draw_row_text :: (app: *App, row: *[MAX_COLS] CellVis, count: s32, viewport_y: s32) {
@@ -1921,6 +1953,14 @@ load_config :: (app: *App) {
   py := get_dix_value(dix, int, "padding_y");
   if py != null && py.* >= 0 app.pad_y = cast(float) py.*;
 
+  // Custom post-processing fragment shader (a file path).
+  shader := get_dix_value(dix, string, "custom_shader");
+  if shader != null && shader.count > 0 && shader.count < app.config.custom_shader.count {
+    for i: 0..shader.count-1 app.config.custom_shader[i] = shader.data[i];
+    app.config.custom_shader[shader.count] = 0;
+    app.config.has_custom_shader = true;
+  }
+
   // Custom colors.
   if read_color(dix, "background", *app.config.bg) app.config.has_bg = true;
   if read_color(dix, "foreground", *app.config.fg) app.config.has_fg = true;
@@ -2018,6 +2058,15 @@ main :: () {
   SetTargetFPS(60);
   SetExitKey(0);
 
+  if !sdf_shader_init() {
+    print("Failed to load the SDF text shader.\n");
+    CloseWindow();
+    return;
+  }
+
+  shader_path: *u8 = ifx app.config.has_custom_shader then app.config.custom_shader.data else null;
+  post_init(shader_path);
+
   font_override: *u8 = ifx app.config.has_font then app.config.font.data else null;
   if !TextEngine_init(*app.text, cast(s32) app.font_size, font_override) {
     print("Failed to initialize text rendering.\n");
@@ -2067,8 +2116,15 @@ main :: () {
     layout(*app);
     update_title(*app);
 
-    BeginDrawing();
+    post_resize();
+    post_time += GetFrameTime();
+
+    BeginTextureMode(post_target);
     render_terminal(*app);
+    EndTextureMode();
+
+    BeginDrawing();
+    post_draw();
     EndDrawing();
 
     if app.shot_path != null && !app.shot_done && GetTime() - start_time > 1.5 {
@@ -2085,6 +2141,9 @@ main :: () {
   }
 
   render_worker_stop();
+  if sdf_shader.id != 0 UnloadShader(sdf_shader);
+  if post_has_shader && post_shader.id != 0 UnloadShader(post_shader);
+  if post_target.id != 0 UnloadRenderTexture(post_target);
 
   // Text resources.
   for i: 0..GLYPH_CACHE_CAP-1 {

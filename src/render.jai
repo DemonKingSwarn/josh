@@ -503,3 +503,160 @@ emoji_glyph :: (eng: *TextEngine, glyph: u32) -> *GlyphEntry {
   render_submit_emoji(glyph);
   return g;
 }
+
+// ---------------------------------------------------------------------------
+// SDF text rendering
+
+// Monochrome glyphs are stored as a signed distance field and rasterized on
+// the GPU by this fragment shader, which reconstructs the coverage from the
+// distance value (0 = far outside, ~0.5 = edge, 1 = far inside).
+
+sdf_shader: Shader;
+sdf_smoothing_loc: s32;
+
+SDF_SMOOTHING :: 0.05;
+
+SDF_VS :: #string END
+#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+uniform mat4 mvp;
+out vec2 fragTexCoord;
+out vec4 fragColor;
+void main() {
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+END
+
+SDF_FS :: #string END
+#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+out vec4 finalColor;
+uniform sampler2D texture0;
+uniform float smoothing;
+void main() {
+    float d = texture(texture0, fragTexCoord).r;
+    float a = smoothstep(0.5 - smoothing, 0.5 + smoothing, d);
+    finalColor = vec4(fragColor.rgb, fragColor.a * a);
+}
+END
+
+sdf_shader_init :: () -> bool {
+  sdf_shader = LoadShaderFromMemory(SDF_VS.data, SDF_FS.data);
+  if sdf_shader.id == 0 return false;
+  sdf_smoothing_loc = GetShaderLocation(sdf_shader, "smoothing");
+  smoothing: float = SDF_SMOOTHING;
+  SetShaderValue(sdf_shader, sdf_smoothing_loc, *smoothing, cast(s32) ShaderUniformDataType.FLOAT);
+  return true;
+}
+
+// Convert a FreeType SDF bitmap (8-bit signed distance, GRAY) into RGBA.
+ft_sdf_to_rgba :: (bm: *FT_Bitmap, out_w: *s32, out_h: *s32) -> *u8 {
+  w := cast(s32) bm.width;
+  h := cast(s32) bm.rows;
+  if bm.buffer == null || w <= 0 || h <= 0 return null;
+  count := w * h;
+  pixels := malloc(cast(u64) (count * 4));
+  if pixels == null return null;
+
+  for y: 0..h-1 {
+    row := ifx bm.pitch < 0 then bm.buffer + (h - 1 - y) * (-bm.pitch)
+                          else bm.buffer + y * bm.pitch;
+    for x: 0..w-1 {
+      v := row[x];
+      dst := pixels + (y * w + x) * 4;
+      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+    }
+  }
+
+  out_w.* = w;
+  out_h.* = h;
+  return pixels;
+}
+
+// ---------------------------------------------------------------------------
+// Post-processing (custom fullscreen fragment shader)
+
+// The terminal is rendered into an off-screen target, then blitted to the
+// screen with an optional user fragment shader (for window effects). The
+// shader receives the scene as `texture0`, plus `iTime` and `iResolution`.
+
+post_target: RenderTexture2D;
+post_shader: Shader;
+post_has_shader: bool;
+post_iTime_loc: s32;
+post_iResolution_loc: s32;
+post_time: float;
+
+read_shader_file :: (path: *u8) -> *u8 {
+  f := fopen(path, "rb");
+  if f == null return null;
+  fseek(f, 0, 2); // SEEK_END
+  size := ftell(f);
+  fseek(f, 0, 0); // SEEK_SET
+  buf := malloc(cast(u64) size + 1);
+  if buf == null {
+    fclose(f);
+    return null;
+  }
+  if size > 0 fread(buf, cast(u64) 1, cast(u64) size, f);
+  buf[size] = 0;
+  fclose(f);
+  return buf;
+}
+
+post_init :: (shader_path: *u8) -> bool {
+  post_target = LoadRenderTexture(GetScreenWidth(), GetScreenHeight());
+  post_has_shader = false;
+  post_time = 0.0;
+
+  if shader_path != null && shader_path[0] != 0 {
+    fs_source := read_shader_file(shader_path);
+    if fs_source != null {
+      post_shader = LoadShaderFromMemory(SDF_VS.data, fs_source);
+      free(fs_source);
+      if post_shader.id != 0 {
+        post_has_shader = true;
+        post_iTime_loc = GetShaderLocation(post_shader, "iTime");
+        post_iResolution_loc = GetShaderLocation(post_shader, "iResolution");
+        res: [2] float = .[cast(float) GetScreenWidth(), cast(float) GetScreenHeight()];
+        SetShaderValue(post_shader, post_iResolution_loc, res.data, cast(s32) ShaderUniformDataType.VEC2);
+      } else {
+        print("Failed to compile custom shader '%'.\n", cstr_to_string(shader_path));
+      }
+    } else {
+      print("Could not read custom shader file '%'.\n", cstr_to_string(shader_path));
+    }
+  }
+  return true;
+}
+
+post_resize :: () {
+  w := GetScreenWidth();
+  h := GetScreenHeight();
+  if post_target.texture.width != w || post_target.texture.height != h {
+    if post_target.id != 0 UnloadRenderTexture(post_target);
+    post_target = LoadRenderTexture(w, h);
+    if post_has_shader {
+      res: [2] float = .[cast(float) w, cast(float) h];
+      SetShaderValue(post_shader, post_iResolution_loc, res.data, cast(s32) ShaderUniformDataType.VEC2);
+    }
+  }
+}
+
+post_draw :: () {
+  tex := post_target.texture;
+  src := Rectangle.{0.0, 0.0, cast(float) tex.width, -cast(float) tex.height};
+  if post_has_shader {
+    BeginShaderMode(post_shader);
+    SetShaderValue(post_shader, post_iTime_loc, *post_time, cast(s32) ShaderUniformDataType.FLOAT);
+    DrawTextureRec(tex, src, Vector2.{0.0, 0.0}, WHITE_COLOR);
+    EndShaderMode();
+  } else {
+    DrawTextureRec(tex, src, Vector2.{0.0, 0.0}, WHITE_COLOR);
+  }
+}

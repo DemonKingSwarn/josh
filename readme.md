@@ -16,6 +16,11 @@ Configuration is read from `$XDG_CONFIG_HOME/josh/config.dix` (or
 `$HOME/.config/josh/config.dix` when `XDG_CONFIG_HOME` is unset) and uses the
 [dix](https://github.com/demonkingswarn/dix) language. Everything is optional.
 
+Supported keys: `font`, `font_size`, `padding_x`, `padding_y`, `background`,
+`foreground`, `cursor`, a nested `palette`, and `custom_shader` — a path to a
+GLSL fragment shader applied as a fullscreen post-process. The shader receives
+the rendered scene as `texture0`, plus `iTime` and `iResolution` uniforms.
+
 ## Features
 
 - Real PTY (`fork`/`setsid`/`TIOCSCTTY`), so full-screen apps, job control and signals work.
@@ -32,4 +37,5 @@ Configuration is read from `$XDG_CONFIG_HOME/josh/config.dix` (or
 - Scrollback (mouse wheel), typing returns to the bottom.
 - Window title from the terminal's OSC sequence.
 - Configuration via dix (font, font size, padding, colors).
+- Custom post-processing shader (`custom_shader`) for window effects.
 

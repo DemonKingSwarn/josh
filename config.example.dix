@@ -7,6 +7,10 @@ background = "#1e1e2e";
 foreground = "#cdd6f4";
 cursor    = "#f5e0dc";
 
+// Optional fullscreen post-processing fragment shader (a file path).
+// The shader receives the scene as `texture0`, plus `iTime` and `iResolution`.
+// custom_shader = "/path/to/effect.fs";
+
 // 16-color palette overrides.
 palette = {
   black         = "#45475a";
