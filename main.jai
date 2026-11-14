@@ -12,6 +12,7 @@
 #import "POSIX";
 #import "Raylib";
 #import "libghostty-vt-jai";
+#import "dix";
 
 libc :: #library,system "libc";
 freetype :: #library,system "libfreetype";
@@ -486,7 +487,7 @@ TextEngine_load_for_cp :: (eng: *TextEngine, cp: u32) -> s32 {
   return TextEngine_load_face(eng, path.data, index);
 }
 
-TextEngine_init :: (eng: *TextEngine, size: s32) -> bool {
+TextEngine_init :: (eng: *TextEngine, size: s32, custom_font: *u8) -> bool {
   eng.size_px = size;
   eng.primary = -1;
   eng.emoji = -1;
@@ -501,26 +502,38 @@ TextEngine_init :: (eng: *TextEngine, size: s32) -> bool {
     return false;
   }
 
-  // Primary monospace face, most preferred first. Nerd Font families carry
-  // the private-use glyphs prompts and file managers use.
-  monospace_families: [12] string = .[
-    "JetBrainsMono Nerd Font Mono",
-    "JetBrainsMono Nerd Font",
-    "JetBrains Mono",
-    "FiraCode Nerd Font",
-    "Cascadia Mono",
-    "Cascadia Code",
-    "Ubuntu Mono",
-    "Noto Sans Mono",
-    "Liberation Mono",
-    "DejaVu Sans Mono",
-    "Courier New",
-    "monospace",
-  ];
-  for i: 0..monospace_families.count-1 {
-    f := monospace_families[i];
-    eng.primary = TextEngine_load_family(eng, f.data, true);
-    if eng.primary >= 0 break;
+  // A font chosen in the config file wins over the built-in preference list.
+  if custom_font != null && custom_font[0] != 0 {
+    eng.primary = TextEngine_load_family(eng, custom_font, true);
+    if eng.primary >= 0 {
+      // Keep going: emoji and fallbacks are still loaded below.
+    } else {
+      print("Configured font '%' was not found; falling back.\n", cstr_to_string(custom_font));
+    }
+  }
+
+  if eng.primary < 0 {
+    // Primary monospace face, most preferred first. Nerd Font families carry
+    // the private-use glyphs prompts and file managers use.
+    monospace_families: [12] string = .[
+      "JetBrainsMono Nerd Font Mono",
+      "JetBrainsMono Nerd Font",
+      "JetBrains Mono",
+      "FiraCode Nerd Font",
+      "Cascadia Mono",
+      "Cascadia Code",
+      "Ubuntu Mono",
+      "Noto Sans Mono",
+      "Liberation Mono",
+      "DejaVu Sans Mono",
+      "Courier New",
+      "monospace",
+    ];
+    for i: 0..monospace_families.count-1 {
+      f := monospace_families[i];
+      eng.primary = TextEngine_load_family(eng, f.data, true);
+      if eng.primary >= 0 break;
+    }
   }
   if eng.primary < 0 {
     print("Could not find a monospace font with Fontconfig.\n");
@@ -917,7 +930,21 @@ ImageCacheEntry :: struct {
 // ---------------------------------------------------------------------------
 // Application state
 
+Config :: struct {
+  font:        [256] u8;
+  has_font:    bool;
+  bg:          GhosttyColorRgb;
+  fg:          GhosttyColorRgb;
+  cursor:      GhosttyColorRgb;
+  has_bg:      bool;
+  has_fg:      bool;
+  has_cursor:  bool;
+  palette:     [16] GhosttyColorRgb;
+  has_palette: [16] bool;
+}
+
 App :: struct {
+  config:     Config;
   term:       GhosttyTerminal;
   render:     GhosttyRenderState;
   rows_iter:  GhosttyRenderStateRowIterator;
@@ -946,7 +973,8 @@ App :: struct {
   cell_w:     float;
   cell_h:     float;
   font_size:  float;
-  pad:        float;
+  pad_x:      float;
+  pad_y:      float;
   baseline:   float;
   text:       TextEngine;
 
@@ -1436,10 +1464,10 @@ send_mouse :: (app: *App, action: GhosttyMouseAction, button: GhosttyMouseButton
   size.screen_height = cast(u32) GetScreenHeight();
   size.cell_width = cast(u32) (app.cell_w + 0.5);
   size.cell_height = cast(u32) (app.cell_h + 0.5);
-  size.padding_top = cast(u32) app.pad;
-  size.padding_bottom = cast(u32) app.pad;
-  size.padding_left = cast(u32) app.pad;
-  size.padding_right = cast(u32) app.pad;
+  size.padding_top = cast(u32) app.pad_y;
+  size.padding_bottom = cast(u32) app.pad_y;
+  size.padding_left = cast(u32) app.pad_x;
+  size.padding_right = cast(u32) app.pad_x;
   ghostty_mouse_encoder_set(app.mouse_enc, .SIZE, *size);
 
   any := IsMouseButtonDown(RM_LEFT) || IsMouseButtonDown(RM_RIGHT) || IsMouseButtonDown(RM_MIDDLE);
@@ -1460,9 +1488,9 @@ send_mouse :: (app: *App, action: GhosttyMouseAction, button: GhosttyMouseButton
 }
 
 mouse_to_cell :: (app: *App, pos: Vector2, col: *s32, row: *s32) -> bool {
-  if pos.x < app.pad || pos.y < app.pad return false;
-  x := cast(s32) ((pos.x - app.pad) / app.cell_w);
-  y := cast(s32) ((pos.y - app.pad) / app.cell_h);
+  if pos.x < app.pad_x || pos.y < app.pad_y return false;
+  x := cast(s32) ((pos.x - app.pad_x) / app.cell_w);
+  y := cast(s32) ((pos.y - app.pad_y) / app.cell_h);
   if x < 0 || y < 0 || x >= cast(s32) app.cols || y >= cast(s32) app.rows return false;
   col.* = x;
   row.* = y;
@@ -1484,7 +1512,7 @@ install_selection :: (app: *App, sel: *GhosttySelection) {
 selection_geometry :: (app: *App, geo: *GhosttySelectionGestureGeometry) {
   geo.columns = cast(u32) app.cols;
   geo.cell_width = cast(u32) (app.cell_w + 0.5);
-  geo.padding_left = cast(u32) app.pad;
+  geo.padding_left = cast(u32) app.pad_x;
   geo.screen_height = cast(u32) GetScreenHeight();
 }
 
@@ -1654,8 +1682,8 @@ layout :: (app: *App) {
   sw := cast(float) GetScreenWidth();
   sh := cast(float) GetScreenHeight();
 
-  cols := cast(u16) max(1, cast(s32) ((sw - app.pad * 2) / app.cell_w));
-  rows := cast(u16) max(1, cast(s32) ((sh - app.pad * 2) / app.cell_h));
+  cols := cast(u16) max(1, cast(s32) ((sw - app.pad_x * 2) / app.cell_w));
+  rows := cast(u16) max(1, cast(s32) ((sh - app.pad_y * 2) / app.cell_h));
 
   if cols == app.cols && rows == app.rows return;
 
@@ -1780,8 +1808,8 @@ collect_row :: (app: *App, cursor_x: s32, cursor_y: s32, cursor_block: bool,
 draw_row_backgrounds :: (app: *App, row: *[MAX_COLS] CellVis, count: s32, viewport_y: s32) {
   for i: 0..count-1 {
     cv := *row.*[i];
-    cx := app.pad + cast(float) cv.x * app.cell_w;
-    cy := app.pad + cast(float) viewport_y * app.cell_h;
+    cx := app.pad_x + cast(float) cv.x * app.cell_w;
+    cy := app.pad_y + cast(float) viewport_y * app.cell_h;
     w := cast(s32) (app.cell_w + 0.5);
     h := cast(s32) (app.cell_h + 0.5);
     if cv.has_bg DrawRectangle(cast(s32) (cx + 0.5), cast(s32) (cy + 0.5), w, h, cv.bg);
@@ -1837,8 +1865,7 @@ draw_wide_cell :: (app: *App, cv: *CellVis, cell_y: float) {
 
   g := TextEngine_glyph(*app.text, cv.face, infos[0].codepoint);
   target_w := ifx cv.wide then app.cell_w * 2.0 else app.cell_w;
-  cx := app.pad + cast(float) cv.x * app.cell_w;
-
+  cx := app.pad_x + cast(float) cv.x * app.cell_w;
   draw_scaled_glyph(app, g, cx, cell_y, target_w, app.cell_h, cv.fg);
 }
 
@@ -1858,7 +1885,7 @@ draw_shaped_run :: (app: *App, start_col: s32, cell_y: float, text: *u8, len: u6
   positions := hb_buffer_get_glyph_positions(app.text.hb_buf, null);
   if infos == null || positions == null return;
 
-  base_x := app.pad + cast(float) start_col * app.cell_w;
+  base_x := app.pad_x + cast(float) start_col * app.cell_w;
   j := 0;
   for i: 0..cast(s32) length-1 {
     cluster := infos[i].cluster;
@@ -1875,7 +1902,7 @@ draw_shaped_run :: (app: *App, start_col: s32, cell_y: float, text: *u8, len: u6
 }
 
 draw_row_text :: (app: *App, row: *[MAX_COLS] CellVis, count: s32, viewport_y: s32) {
-  cell_y := app.pad + cast(float) viewport_y * app.cell_h;
+  cell_y := app.pad_y + cast(float) viewport_y * app.cell_h;
 
   run_text: [8192] u8;
   run_starts: [MAX_COLS] u64;
@@ -1927,7 +1954,7 @@ draw_row_text :: (app: *App, row: *[MAX_COLS] CellVis, count: s32, viewport_y: s
 
   for i: 0..count-1 {
     cv := *row.*[i];
-    cx := app.pad + cast(float) cv.x * app.cell_w;
+    cx := app.pad_x + cast(float) cv.x * app.cell_w;
     if cv.underline {
       DrawRectangle(cast(s32) (cx + 0.5), cast(s32) (cell_y + app.cell_h - 2.0),
         cast(s32) (app.cell_w + 0.5), 1, cv.fg);
@@ -2104,8 +2131,8 @@ draw_images :: (app: *App, layer: u32) {
     src_y := cast(float) p.source_y;
     src_w := ifx p.source_w > 0 then cast(float) p.source_w else cast(float) tex.width;
     src_h := ifx p.source_h > 0 then cast(float) p.source_h else cast(float) tex.height;
-    dst_x := app.pad + cast(float) p.col * app.cell_w + cast(float) p.offset_x;
-    dst_y := app.pad + cast(float) p.row * app.cell_h + cast(float) p.offset_y;
+    dst_x := app.pad_x + cast(float) p.col * app.cell_w + cast(float) p.offset_x;
+    dst_y := app.pad_y + cast(float) p.row * app.cell_h + cast(float) p.offset_y;
     DrawTexturePro(tex, Rectangle.{src_x, src_y, src_w, src_h},
       Rectangle.{dst_x, dst_y, cast(float) p.pixel_w, cast(float) p.pixel_h},
       Vector2.{0.0, 0.0}, 0.0, WHITE_COLOR);
@@ -2155,10 +2182,10 @@ render_terminal :: (app: *App) {
 
   collect_images(app);
 
-  sw := cast(s32) (app.pad + cast(float) app.cols * app.cell_w);
-  sh := cast(s32) (app.pad + cast(float) app.rows * app.cell_h);
-  BeginScissorMode(cast(s32) app.pad, cast(s32) app.pad,
-    sw - cast(s32) app.pad, sh - cast(s32) app.pad);
+  sw := cast(s32) (app.pad_x + cast(float) app.cols * app.cell_w);
+  sh := cast(s32) (app.pad_y + cast(float) app.rows * app.cell_h);
+  BeginScissorMode(cast(s32) app.pad_x, cast(s32) app.pad_y,
+    sw - cast(s32) app.pad_x, sh - cast(s32) app.pad_y);
 
   // Images below the cell backgrounds.
   draw_images(app, cast(u32) GhosttyImageLayer.BELOW_BACKGROUND);
@@ -2203,8 +2230,8 @@ render_terminal :: (app: *App) {
 
   // Non-block cursor shapes.
   if cursor_visible && !cursor_block {
-    cx := app.pad + cast(float) cur.viewport_x * app.cell_w;
-    cy := app.pad + cast(float) cur.viewport_y * app.cell_h;
+    cx := app.pad_x + cast(float) cur.viewport_x * app.cell_w;
+    cy := app.pad_y + cast(float) cur.viewport_y * app.cell_h;
     if cur.visual_style == GhosttyCursorStyle.BAR {
       DrawRectangle(cast(s32) (cx + 0.5), cast(s32) (cy + 0.5), 2,
         cast(s32) (app.cell_h + 0.5), cursor_color);
@@ -2219,6 +2246,124 @@ render_terminal :: (app: *App) {
 }
 
 // ---------------------------------------------------------------------------
+// Configuration (dix)
+
+cstr_to_string :: (s: *u8) -> string {
+  return string.{cast(s64) strlen(s), s};
+}
+
+config_path :: (buf: *[1024] u8) -> *u8 {
+  dst := buf.data;
+  n: u64 = 0;
+
+  base := getenv("XDG_CONFIG_HOME");
+  use_home := false;
+  if base == null || base[0] == 0 {
+    base = getenv("HOME");
+    if base == null || base[0] == 0 return null;
+    use_home = true;
+  }
+
+  blen := strlen(base);
+  if blen + 32 >= buf.count return null;
+  for i: 0..blen-1 dst[i] = base[i];
+  n = blen;
+
+  if use_home {
+    suffix := "/.config";
+    for i: 0..suffix.count-1 dst[n + cast(u64) i] = suffix.data[i];
+    n += cast(u64) suffix.count;
+  }
+
+  tail := "/josh/config.dix";
+  for i: 0..tail.count-1 dst[n + cast(u64) i] = tail.data[i];
+  n += cast(u64) tail.count;
+  dst[n] = 0;
+  return dst;
+}
+
+read_color :: (dix: Dix, key: string, out: *GhosttyColorRgb) -> bool {
+  s := get_dix_value(dix, string, key);
+  if s == null return false;
+  if ghostty_color_parse(s.data, cast(u64) s.count, out) == .SUCCESS return true;
+  return false;
+}
+
+load_config :: (app: *App) {
+  path: [1024] u8;
+  p := config_path(*path);
+  if p == null return;
+  if !FileExists(p) return;
+
+  dix, ok := load_dix_from_file(cstr_to_string(p));
+  if !ok {
+    print("Failed to parse config file: %\n", cstr_to_string(p));
+    return;
+  }
+
+  // Custom font family.
+  font := get_dix_value(dix, string, "font");
+  if font != null && font.count > 0 && font.count < app.config.font.count {
+    for i: 0..font.count-1 app.config.font[i] = font.data[i];
+    app.config.font[font.count] = 0;
+    app.config.has_font = true;
+  }
+
+  // Font size (accept either an integer or a float).
+  fs := get_dix_value(dix, float, "font_size");
+  if fs != null && fs.* > 0.0 {
+    app.font_size = fs.*;
+  } else {
+    fsi := get_dix_value(dix, int, "font_size");
+    if fsi != null && fsi.* > 0 app.font_size = cast(float) fsi.*;
+  }
+
+  // Terminal padding.
+  px := get_dix_value(dix, int, "padding_x");
+  if px != null && px.* >= 0 app.pad_x = cast(float) px.*;
+  py := get_dix_value(dix, int, "padding_y");
+  if py != null && py.* >= 0 app.pad_y = cast(float) py.*;
+
+  // Custom colors.
+  if read_color(dix, "background", *app.config.bg) app.config.has_bg = true;
+  if read_color(dix, "foreground", *app.config.fg) app.config.has_fg = true;
+  if read_color(dix, "cursor", *app.config.cursor) app.config.has_cursor = true;
+
+  // 16-colour palette, read from a nested `palette` object.
+  palette_keys: [16] string = .[
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    "bright_black", "bright_red", "bright_green", "bright_yellow",
+    "bright_blue", "bright_magenta", "bright_cyan", "bright_white",
+  ];
+  for i: 0..15 {
+    s := get_dix_value(dix, string, "palette", palette_keys[i]);
+    if s == null continue;
+    c: GhosttyColorRgb;
+    if ghostty_color_parse(s.data, cast(u64) s.count, *c) == .SUCCESS {
+      app.config.palette[i] = c;
+      app.config.has_palette[i] = true;
+    }
+  }
+}
+
+apply_config_colors :: (app: *App) {
+  if app.config.has_bg    ghostty_terminal_set(app.term, .COLOR_BACKGROUND, *app.config.bg);
+  if app.config.has_fg    ghostty_terminal_set(app.term, .COLOR_FOREGROUND, *app.config.fg);
+  if app.config.has_cursor ghostty_terminal_set(app.term, .COLOR_CURSOR, *app.config.cursor);
+
+  any_palette := false;
+  for i: 0..15 if app.config.has_palette[i] { any_palette = true; break; }
+  if any_palette {
+    palette: [256] GhosttyColorRgb;
+    ghostty_color_palette_default(palette.data);
+    for i: 0..15 {
+      if app.config.has_palette[i] palette[i] = app.config.palette[i];
+    }
+    ghostty_terminal_set(app.term, .COLOR_PALETTE, palette.data);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 
 main :: () {
@@ -2228,7 +2373,8 @@ main :: () {
   app: App;
   app.master = -1;
   app.child_pid = -1;
-  app.pad = 4.0;
+  app.pad_x = 4.0;
+  app.pad_y = 4.0;
   app.font_size = 20.0;
 
   if !spawn_shell(*app, 80, 24) {
@@ -2243,6 +2389,9 @@ main :: () {
 
   max_lines: u64 = 10_000;
   ghostty_terminal_set(app.term, .SCROLLBACK_MAX_LINES, *max_lines);
+
+  load_config(*app);
+  apply_config_colors(*app);
 
   if ghostty_render_state_new(null, *app.render) != .SUCCESS ||
      ghostty_render_state_row_iterator_new(null, *app.rows_iter) != .SUCCESS ||
@@ -2275,7 +2424,8 @@ main :: () {
   SetTargetFPS(60);
   SetExitKey(0);
 
-  if !TextEngine_init(*app.text, cast(s32) app.font_size) {
+  font_override: *u8 = ifx app.config.has_font then app.config.font.data else null;
+  if !TextEngine_init(*app.text, cast(s32) app.font_size, font_override) {
     print("Failed to initialize text rendering.\n");
     CloseWindow();
     return;
