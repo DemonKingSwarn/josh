@@ -1,37 +1,16 @@
-// Emoji + Kitty image rasterization, offloaded to a worker thread.
+// Emoji (OT-SVG/COLR) glyph rasterization, offloaded to a worker thread.
 //
-// The main thread never touches librsvg/cairo or does bulk pixel-format
-// conversion; it only submits jobs and, when a result is ready, uploads the
-// finished RGBA buffer to the GPU (which must happen on the GL thread).
+// The main thread never touches librsvg/cairo; it submits glyph jobs and,
+// when a result is ready, uploads the finished RGBA buffer to the GPU.
 
 RENDER_JOB_CAP :: 64;
 
-RenderJobKind :: enum {
-  EMOJI;
-  IMAGE;
-}
-
-RenderJob :: struct {
-  kind:       RenderJobKind;
-  glyph:      u32;              // EMOJI
-  raw:        *u8;              // IMAGE: raw pixels (owned by the job)
-  raw_len:    u64;
-  format:     GhosttyKittyImageFormat;
-  img_w:      s32;
-  img_h:      s32;
-  image_id:   u32;
-  generation: u64;
-}
-
 RenderResult :: struct {
-  kind:       RenderJobKind;
-  glyph:      u32;
-  image_id:   u32;
-  generation: u64;
-  w:          s32;
-  h:          s32;
-  color:      bool;
-  pixels:     *u8;              // malloc'd RGBA, freed by the consumer
+  glyph:  u32;
+  w:      s32;
+  h:      s32;
+  color:  bool;
+  pixels: *u8;              // malloc'd RGBA, freed by the consumer
 }
 
 RenderWorker :: struct {
@@ -41,7 +20,7 @@ RenderWorker :: struct {
   ft_lib:   *void;
   ft_face:  *FT_FaceRec;
 
-  jobs:     [RENDER_JOB_CAP] RenderJob;
+  jobs:     [RENDER_JOB_CAP] u32;
   job_head: s32;
   job_tail: s32;
 
@@ -318,7 +297,7 @@ render_worker_main :: (arg: *void) -> *void #c_call {
   push_context {
     worker := cast(*RenderWorker) arg;
     while true {
-      job: RenderJob;
+      glyph: u32 = 0;
       has_job := false;
 
       pthread_mutex_lock(*worker.mutex);
@@ -327,7 +306,7 @@ render_worker_main :: (arg: *void) -> *void #c_call {
         break;
       }
       if worker.job_head != worker.job_tail {
-        job = worker.jobs[worker.job_head];
+        glyph = worker.jobs[worker.job_head];
         worker.job_head = (worker.job_head + 1) & (RENDER_JOB_CAP - 1);
         has_job = true;
       }
@@ -340,20 +319,9 @@ render_worker_main :: (arg: *void) -> *void #c_call {
 
       result: RenderResult;
       result = RenderResult.{};
-      result.kind = job.kind;
-
-      if job.kind == .EMOJI {
-        result.glyph = job.glyph;
-        result.pixels = render_emoji_glyph(worker.ft_face, job.glyph,
-          *result.w, *result.h, *result.color);
-      } else {
-        result.image_id = job.image_id;
-        result.generation = job.generation;
-        result.w = job.img_w;
-        result.h = job.img_h;
-        result.pixels = image_pixels_to_rgba(job.raw, job.raw_len, job.format, job.img_w, job.img_h);
-        if job.raw != null free(job.raw);
-      }
+      result.glyph = glyph;
+      result.pixels = render_emoji_glyph(worker.ft_face, glyph,
+        *result.w, *result.h, *result.color);
 
       pthread_mutex_lock(*worker.mutex);
       if ((worker.res_tail + 1) & (RENDER_JOB_CAP - 1)) != worker.res_head {
@@ -413,32 +381,8 @@ render_worker_stop :: () {
 render_submit_emoji :: (glyph: u32) {
   pthread_mutex_lock(*render_worker.mutex);
   if ((render_worker.job_tail + 1) & (RENDER_JOB_CAP - 1)) != render_worker.job_head {
-    job := *render_worker.jobs[render_worker.job_tail];
-    job.* = RenderJob.{};
-    job.kind = .EMOJI;
-    job.glyph = glyph;
+    render_worker.jobs[render_worker.job_tail] = glyph;
     render_worker.job_tail = (render_worker.job_tail + 1) & (RENDER_JOB_CAP - 1);
-  }
-  pthread_mutex_unlock(*render_worker.mutex);
-}
-
-render_submit_image :: (raw: *u8, raw_len: u64, format: GhosttyKittyImageFormat,
-                        w: s32, h: s32, image_id: u32, generation: u64) {
-  pthread_mutex_lock(*render_worker.mutex);
-  if ((render_worker.job_tail + 1) & (RENDER_JOB_CAP - 1)) != render_worker.job_head {
-    job := *render_worker.jobs[render_worker.job_tail];
-    job.* = RenderJob.{};
-    job.kind = .IMAGE;
-    job.raw = raw;
-    job.raw_len = raw_len;
-    job.format = format;
-    job.img_w = w;
-    job.img_h = h;
-    job.image_id = image_id;
-    job.generation = generation;
-    render_worker.job_tail = (render_worker.job_tail + 1) & (RENDER_JOB_CAP - 1);
-  } else {
-    if raw != null free(raw);
   }
   pthread_mutex_unlock(*render_worker.mutex);
 }
@@ -458,7 +402,7 @@ upload_rgba_texture :: (pixels: *u8, w: s32, h: s32) -> Texture2D {
 }
 
 // Drain worker results and upload them to textures on the GL thread.
-render_poll :: (eng: *TextEngine, app: *App) {
+render_poll :: (eng: *TextEngine) {
   local: [RENDER_JOB_CAP] RenderResult;
   n: s32 = 0;
 
@@ -474,21 +418,12 @@ render_poll :: (eng: *TextEngine, app: *App) {
     r := local[i];
     if r.pixels == null continue;
 
-    if r.kind == .EMOJI {
-      g := glyph_find(eng, eng.emoji, r.glyph);
-      if g != null && g.tex.id == 0 {
-        g.w = r.w;
-        g.h = r.h;
-        g.color = r.color;
-        g.tex = upload_rgba_texture(r.pixels, r.w, r.h);
-      }
-    } else {
-      e := image_cache_find(app, r.image_id);
-      if e != null && e.tex.id == 0 && e.generation == r.generation {
-        e.w = r.w;
-        e.h = r.h;
-        e.tex = upload_rgba_texture(r.pixels, r.w, r.h);
-      }
+    g := glyph_find(eng, eng.emoji, r.glyph);
+    if g != null && g.tex.id == 0 {
+      g.w = r.w;
+      g.h = r.h;
+      g.color = r.color;
+      g.tex = upload_rgba_texture(r.pixels, r.w, r.h);
     }
     free(r.pixels);
   }

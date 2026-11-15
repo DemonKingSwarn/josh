@@ -1707,23 +1707,44 @@ submit_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
   expected := cast(u64) w * cast(u64) h * bpp;
   if pixels.len < expected return empty;
 
-  // Reserve a cache slot now (pending), then copy the raw pixels and hand the
-  // format conversion to the worker thread.
+  // Reserve a cache slot and upload with the GPU's native pixel format. The
+  // common RGB/RGBA cases are passed straight through (the GPU handles the
+  // format); gray formats are converted to RGBA in a small CPU pass.
   e := image_cache_slot(app);
   e.used = true;
   e.id = id;
   e.generation = generation;
   e.w = cast(s32) w;
   e.h = cast(s32) h;
-  e.tex.id = 0;
   e.last_used = app.frame;
 
-  raw := malloc(expected);
-  if raw == null return empty;
-  memcpy(raw, pixels.ptr, expected);
+  im: Image;
+  im.width = cast(s32) w;
+  im.height = cast(s32) h;
+  im.mipmaps = 1;
 
-  render_submit_image(raw, expected, format, cast(s32) w, cast(s32) h, id, generation);
-  return empty;
+  converted: *u8 = null;
+  if format == .RGBA {
+    im.format = 7; // UNCOMPRESSED_R8G8B8A8
+    im.data = pixels.ptr;
+  } else if format == .RGB {
+    im.format = 4; // UNCOMPRESSED_R8G8B8
+    im.data = pixels.ptr;
+  } else {
+    converted = image_pixels_to_rgba(pixels.ptr, expected, format, cast(s32) w, cast(s32) h);
+    if converted == null return empty;
+    im.format = 7;
+    im.data = converted;
+  }
+
+  tex := LoadTextureFromImage(im);
+  if converted != null free(converted);
+
+  if tex.id != 0 {
+    SetTextureFilter(tex, 1);
+    e.tex = tex;
+  }
+  return tex;
 }
 
 get_image_texture :: (app: *App, id: u32, generation: u64) -> Texture2D {
@@ -1773,7 +1794,7 @@ render_terminal :: (app: *App) {
   }
 
   // Upload any emoji / image rasterization the worker has finished.
-  render_poll(*app.text, app);
+  render_poll(*app.text);
 
   bg: GhosttyColorRgb;
   fg: GhosttyColorRgb;
