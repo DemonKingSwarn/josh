@@ -610,7 +610,6 @@ read_shader_file :: (path: *u8) -> *u8 {
 }
 
 post_init :: (shader_path: *u8) -> bool {
-  post_target = LoadRenderTexture(GetScreenWidth(), GetScreenHeight());
   post_has_shader = false;
   post_time = 0.0;
 
@@ -623,6 +622,7 @@ post_init :: (shader_path: *u8) -> bool {
         post_has_shader = true;
         post_iTime_loc = GetShaderLocation(post_shader, "iTime");
         post_iResolution_loc = GetShaderLocation(post_shader, "iResolution");
+        post_target = LoadRenderTexture(GetScreenWidth(), GetScreenHeight());
         res: [2] float = .[cast(float) GetScreenWidth(), cast(float) GetScreenHeight()];
         SetShaderValue(post_shader, post_iResolution_loc, res.data, cast(s32) ShaderUniformDataType.VEC2);
       } else {

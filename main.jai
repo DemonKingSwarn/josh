@@ -626,9 +626,6 @@ App :: struct {
 
   title_buf:  [512] u8;
   title_len:  u64;
-
-  shot_path:  *u8;
-  shot_done:  bool;
 }
 
 KEY_LIST: [128] s32;
@@ -1030,10 +1027,6 @@ handle_keyboard :: (app: *App) {
       continue;
     }
 
-    if k == RK_F12 && pressed {
-      TakeScreenshot("jai-terminal.png");
-      continue;
-    }
     had_input = true;
 
     printable := key_is_printable(k);
@@ -2091,9 +2084,6 @@ main :: () {
   app.rows = 0;
   layout(*app);
 
-  app.shot_path = getenv("JAI_TERM_SCREENSHOT");
-  start_time := GetTime();
-
   // Optional startup command, mostly handy for demos and automated checks.
   command := getenv("JAI_TERM_COMMAND");
   if command != null && command[0] != 0 {
@@ -2116,21 +2106,21 @@ main :: () {
     layout(*app);
     update_title(*app);
 
-    post_resize();
-    post_time += GetFrameTime();
+    if post_has_shader {
+      post_resize();
+      post_time += GetFrameTime();
 
-    BeginTextureMode(post_target);
-    render_terminal(*app);
-    EndTextureMode();
+      BeginTextureMode(post_target);
+      render_terminal(*app);
+      EndTextureMode();
 
-    BeginDrawing();
-    post_draw();
-    EndDrawing();
-
-    if app.shot_path != null && !app.shot_done && GetTime() - start_time > 1.5 {
-      TakeScreenshot(app.shot_path);
-      app.shot_done = true;
-      if getenv("JAI_TERM_EXIT") != null break;
+      BeginDrawing();
+      post_draw();
+      EndDrawing();
+    } else {
+      BeginDrawing();
+      render_terminal(*app);
+      EndDrawing();
     }
   }
 

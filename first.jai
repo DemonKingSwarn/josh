@@ -25,11 +25,6 @@ set_options :: (opts: *Build_Options) -> Build_Options {
 
     opts.output_executable_name = exe;
 
-    // so that it doesnt open a cmd prompt window when launching the exe
-    #if OS == .WINDOWS {
-        opts.additional_linker_arguments = .["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"];
-    }
-
     return opts;
 }
 
